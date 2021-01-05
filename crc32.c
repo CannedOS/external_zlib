@@ -1,5 +1,5 @@
 /* crc32.c -- compute the CRC-32 of a data stream
- * Copyright (C) 1995-2006, 2010, 2011, 2012, 2016 Mark Adler
+ * Copyright (C) 1995-2006, 2010, 2011, 2012, 2016, 2018 Mark Adler
  * For conditions of distribution and use, see copyright notice in zlib.h
  *
  * Thanks to Rodney Brown <rbrown64@csc.com.au> for his contribution of faster
@@ -18,7 +18,9 @@
   first call get_crc_table() to initialize the tables before allowing more than
   one thread to use crc32().
 
-  DYNAMIC_CRC_TABLE and MAKECRCH can be #defined to write out crc32.h.
+  DYNAMIC_CRC_TABLE and MAKECRCH can be #defined to write out crc32.h. A main()
+  routine is also produced, so that this one source file can be compiled to an
+  executable.
  */
 
 #ifdef MAKECRCH
@@ -51,20 +53,50 @@
 #endif /* BYFOUR */
 
 /* Local functions for crc concatenation */
-local unsigned long gf2_matrix_times OF((unsigned long *mat,
-                                         unsigned long vec));
-local void gf2_matrix_square OF((unsigned long *square, unsigned long *mat));
+#define GF2_DIM 32      /* dimension of GF(2) vectors (length of CRC) */
+local z_crc_t gf2_matrix_times OF((const z_crc_t *mat, z_crc_t vec));
 local uLong crc32_combine_ OF((uLong crc1, uLong crc2, z_off64_t len2));
+
+/* ========================================================================= */
+local z_crc_t gf2_matrix_times(mat, vec)
+    const z_crc_t *mat;
+    z_crc_t vec;
+{
+    z_crc_t sum;
+
+    sum = 0;
+    while (vec) {
+        if (vec & 1)
+            sum ^= *mat;
+        vec >>= 1;
+        mat++;
+    }
+    return sum;
+}
 
 
 #ifdef DYNAMIC_CRC_TABLE
 
 local volatile int crc_table_empty = 1;
 local z_crc_t FAR crc_table[TBLS][256];
+local z_crc_t FAR crc_comb[GF2_DIM][GF2_DIM];
 local void make_crc_table OF((void));
+local void gf2_matrix_square OF((z_crc_t *square, const z_crc_t *mat));
 #ifdef MAKECRCH
-   local void write_table OF((FILE *, const z_crc_t FAR *));
+   local void write_table OF((FILE *, const z_crc_t FAR *, int));
 #endif /* MAKECRCH */
+
+/* ========================================================================= */
+local void gf2_matrix_square(square, mat)
+    z_crc_t *square;
+    const z_crc_t *mat;
+{
+    int n;
+
+    for (n = 0; n < GF2_DIM; n++)
+        square[n] = gf2_matrix_times(mat, mat[n]);
+}
+
 /*
   Generate tables for a byte-wise 32-bit CRC calculation on the polynomial:
   x^32+x^26+x^23+x^22+x^16+x^12+x^11+x^10+x^8+x^7+x^5+x^4+x^2+x+1.
@@ -133,6 +165,33 @@ local void make_crc_table()
         }
 #endif /* BYFOUR */
 
+        /* generate zero operators table for crc32_combine() */
+
+        /* generate the operator to apply a single zero bit to a CRC -- the
+           first row adds the polynomial if the low bit is a 1, and the
+           remaining rows shift the CRC right one bit */
+        k = GF2_DIM - 3;
+        crc_comb[k][0] = 0xedb88320UL;      /* CRC-32 polynomial */
+        z_crc_t row = 1;
+        for (n = 1; n < GF2_DIM; n++) {
+            crc_comb[k][n] = row;
+            row <<= 1;
+        }
+
+        /* generate operators that apply 2, 4, and 8 zeros to a CRC, putting
+           the last one, the operator for one zero byte, at the 0 position */
+        gf2_matrix_square(crc_comb[k + 1], crc_comb[k]);
+        gf2_matrix_square(crc_comb[k + 2], crc_comb[k + 1]);
+        gf2_matrix_square(crc_comb[0], crc_comb[k + 2]);
+
+        /* generate operators for applying 2^n zero bytes to a CRC, filling out
+           the remainder of the table -- the operators repeat after GF2_DIM
+           values of n, so the table only needs GF2_DIM entries, regardless of
+           the size of the length being processed */
+        for (n = 1; n < k; n++)
+            gf2_matrix_square(crc_comb[n], crc_comb[n - 1]);
+
+        /* mark tables as complete, in case someone else is waiting */
         crc_table_empty = 0;
     }
     else {      /* not first */
@@ -140,27 +199,37 @@ local void make_crc_table()
         while (crc_table_empty)
             ;
     }
-
 #ifdef MAKECRCH
-    /* write out CRC tables to crc32.h */
     {
         FILE *out;
 
         out = fopen("crc32.h", "w");
         if (out == NULL) return;
+
+        /* write out CRC table to crc32.h */
         fprintf(out, "/* crc32.h -- tables for rapid CRC calculation\n");
         fprintf(out, " * Generated automatically by crc32.c\n */\n\n");
         fprintf(out, "local const z_crc_t FAR ");
-        fprintf(out, "crc_table[TBLS][256] =\n{\n  {\n");
-        write_table(out, crc_table[0]);
+        fprintf(out, "crc_table[%d][256] =\n{\n  {\n", TBLS);
+        write_table(out, crc_table[0], 256);
 #  ifdef BYFOUR
         fprintf(out, "#ifdef BYFOUR\n");
         for (k = 1; k < 8; k++) {
             fprintf(out, "  },\n  {\n");
-            write_table(out, crc_table[k]);
+            write_table(out, crc_table[k], 256);
         }
         fprintf(out, "#endif\n");
 #  endif /* BYFOUR */
+        fprintf(out, "  }\n};\n");
+
+        /* write out zero operator table to crc32.h */
+        fprintf(out, "\nlocal const z_crc_t FAR ");
+        fprintf(out, "crc_comb[%d][%d] =\n{\n  {\n", GF2_DIM, GF2_DIM);
+        write_table(out, crc_comb[0], GF2_DIM);
+        for (k = 1; k < GF2_DIM; k++) {
+            fprintf(out, "  },\n  {\n");
+            write_table(out, crc_comb[k], GF2_DIM);
+        }
         fprintf(out, "  }\n};\n");
         fclose(out);
     }
@@ -168,22 +237,30 @@ local void make_crc_table()
 }
 
 #ifdef MAKECRCH
-local void write_table(out, table)
+local void write_table(out, table, k)
     FILE *out;
     const z_crc_t FAR *table;
+    int k;
 {
     int n;
 
-    for (n = 0; n < 256; n++)
+    for (n = 0; n < k; n++)
         fprintf(out, "%s0x%08lxUL%s", n % 5 ? "" : "    ",
                 (unsigned long)(table[n]),
-                n == 255 ? "\n" : (n % 5 == 4 ? ",\n" : ", "));
+                n == k - 1 ? "\n" : (n % 5 == 4 ? ",\n" : ", "));
+}
+
+int main()
+{
+    make_crc_table();
+    return 0;
 }
 #endif /* MAKECRCH */
 
 #else /* !DYNAMIC_CRC_TABLE */
 /* ========================================================================
- * Tables of CRC-32s of all single-byte values, made by make_crc_table().
+ * Tables of CRC-32s of all single-byte values, made by make_crc_table(),
+ * and tables of zero operator matrices for crc32_combine().
  */
 #include "crc32.h"
 #endif /* DYNAMIC_CRC_TABLE */
@@ -205,6 +282,123 @@ const z_crc_t FAR * ZEXPORT get_crc_table()
 #define DO8 DO1; DO1; DO1; DO1; DO1; DO1; DO1; DO1
 
 /* ========================================================================= */
+
+/* =========================================================================
+ * Use ARM machine instructions if available. This will compute the CRC about
+ * ten times faster than the braided calculation. This code does not check for
+ * the presence of the CRC instruction at run time. __ARM_FEATURE_CRC32 will
+ * only be defined if the compilation specifies an ARM processor architecture
+ * that has the instructions. For example, compiling with -march=armv8.1-a or
+ * -march=armv8-a+crc, or -march=native if the compile machine has the crc32
+ * instructions.
+ */
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32) && W == 8
+
+/*
+   Constants empirically determined to maximize speed. These values are from
+   measurements on a Cortex-A57. Your mileage may vary.
+ */
+#define Z_BATCH 3990                /* number of words in a batch */
+#define Z_BATCH_ZEROS 0xa10d3d0c    /* computed from Z_BATCH = 3990 */
+#define Z_BATCH_MIN 800             /* fewest words in a final batch */
+
+unsigned long ZEXPORT crc32_z(crc, buf, len)
+    unsigned long crc;
+    const unsigned char FAR *buf;
+    z_size_t len;
+{
+    z_crc_t val;
+    z_word_t crc1, crc2;
+    const z_word_t *word;
+    z_word_t val0, val1, val2;
+    z_size_t last, last2, i;
+    z_size_t num;
+
+    /* Return initial CRC, if requested. */
+    if (buf == Z_NULL) return 0;
+
+#ifdef DYNAMIC_CRC_TABLE
+    once(&made, make_crc_table);
+#endif /* DYNAMIC_CRC_TABLE */
+
+    /* Pre-condition the CRC */
+    crc ^= 0xffffffff;
+
+    /* Compute the CRC up to a word boundary. */
+    while (len && ((z_size_t)buf & 7) != 0) {
+        len--;
+        val = *buf++;
+        __asm__ volatile("crc32b %w0, %w0, %w1" : "+r"(crc) : "r"(val));
+    }
+
+    /* Prepare to compute the CRC on full 64-bit words word[0..num-1]. */
+    word = (z_word_t const *)buf;
+    num = len >> 3;
+    len &= 7;
+
+    /* Do three interleaved CRCs to realize the throughput of one crc32x
+       instruction per cycle. Each CRC is calcuated on Z_BATCH words. The three
+       CRCs are combined into a single CRC after each set of batches. */
+    while (num >= 3 * Z_BATCH) {
+        crc1 = 0;
+        crc2 = 0;
+        for (i = 0; i < Z_BATCH; i++) {
+            val0 = word[i];
+            val1 = word[i + Z_BATCH];
+            val2 = word[i + 2 * Z_BATCH];
+            __asm__ volatile("crc32x %w0, %w0, %x1" : "+r"(crc) : "r"(val0));
+            __asm__ volatile("crc32x %w0, %w0, %x1" : "+r"(crc1) : "r"(val1));
+            __asm__ volatile("crc32x %w0, %w0, %x1" : "+r"(crc2) : "r"(val2));
+        }
+        word += 3 * Z_BATCH;
+        num -= 3 * Z_BATCH;
+        crc = multmodp(Z_BATCH_ZEROS, crc) ^ crc1;
+        crc = multmodp(Z_BATCH_ZEROS, crc) ^ crc2;
+    }
+
+    /* Do one last smaller batch with the remaining words, if there are enough
+       to pay for the combination of CRCs. */
+    last = num / 3;
+    if (last >= Z_BATCH_MIN) {
+        last2 = last << 1;
+        crc1 = 0;
+        crc2 = 0;
+        for (i = 0; i < last; i++) {
+            val0 = word[i];
+            val1 = word[i + last];
+            val2 = word[i + last2];
+            __asm__ volatile("crc32x %w0, %w0, %x1" : "+r"(crc) : "r"(val0));
+            __asm__ volatile("crc32x %w0, %w0, %x1" : "+r"(crc1) : "r"(val1));
+            __asm__ volatile("crc32x %w0, %w0, %x1" : "+r"(crc2) : "r"(val2));
+        }
+        word += 3 * last;
+        num -= 3 * last;
+        val = x2nmodp(last, 6);
+        crc = multmodp(val, crc) ^ crc1;
+        crc = multmodp(val, crc) ^ crc2;
+    }
+
+    /* Compute the CRC on any remaining words. */
+    for (i = 0; i < num; i++) {
+        val0 = word[i];
+        __asm__ volatile("crc32x %w0, %w0, %x1" : "+r"(crc) : "r"(val0));
+    }
+    word += num;
+
+    /* Complete the CRC on any remaining bytes. */
+    buf = (const unsigned char FAR *)word;
+    while (len) {
+        len--;
+        val = *buf++;
+        __asm__ volatile("crc32b %w0, %w0, %w1" : "+r"(crc) : "r"(val));
+    }
+
+    /* Return the CRC, post-conditioned. */
+    return crc ^ 0xffffffff;
+}
+
+#else
+
 unsigned long ZEXPORT crc32_z(crc, buf, len)
     unsigned long crc;
     const unsigned char FAR *buf;
@@ -270,6 +464,7 @@ unsigned long ZEXPORT crc32_z(crc, buf, len)
     } while (--len);
     return crc ^ 0xffffffffUL;
 }
+#endif
 
 /* ========================================================================= */
 unsigned long ZEXPORT crc32(crc, buf, len)
@@ -392,36 +587,6 @@ local unsigned long crc32_big(crc, buf, len)
 
 #endif /* BYFOUR */
 
-#define GF2_DIM 32      /* dimension of GF(2) vectors (length of CRC) */
-
-/* ========================================================================= */
-local unsigned long gf2_matrix_times(mat, vec)
-    unsigned long *mat;
-    unsigned long vec;
-{
-    unsigned long sum;
-
-    sum = 0;
-    while (vec) {
-        if (vec & 1)
-            sum ^= *mat;
-        vec >>= 1;
-        mat++;
-    }
-    return sum;
-}
-
-/* ========================================================================= */
-local void gf2_matrix_square(square, mat)
-    unsigned long *square;
-    unsigned long *mat;
-{
-    int n;
-
-    for (n = 0; n < GF2_DIM; n++)
-        square[n] = gf2_matrix_times(mat, mat[n]);
-}
-
 /* ========================================================================= */
 local uLong crc32_combine_(crc1, crc2, len2)
     uLong crc1;
@@ -429,53 +594,18 @@ local uLong crc32_combine_(crc1, crc2, len2)
     z_off64_t len2;
 {
     int n;
-    unsigned long row;
-    unsigned long even[GF2_DIM];    /* even-power-of-two zeros operator */
-    unsigned long odd[GF2_DIM];     /* odd-power-of-two zeros operator */
 
-    /* degenerate case (also disallow negative lengths) */
-    if (len2 <= 0)
-        return crc1;
+#ifdef DYNAMIC_CRC_TABLE
+    if (crc_table_empty)
+        make_crc_table();
+#endif /* DYNAMIC_CRC_TABLE */
 
-    /* put operator for one zero bit in odd */
-    odd[0] = 0xedb88320UL;          /* CRC-32 polynomial */
-    row = 1;
-    for (n = 1; n < GF2_DIM; n++) {
-        odd[n] = row;
-        row <<= 1;
-    }
-
-    /* put operator for two zero bits in even */
-    gf2_matrix_square(even, odd);
-
-    /* put operator for four zero bits in odd */
-    gf2_matrix_square(odd, even);
-
-    /* apply len2 zeros to crc1 (first square will put the operator for one
-       zero byte, eight zero bits, in even) */
-    do {
-        /* apply zeros operator for this bit of len2 */
-        gf2_matrix_square(even, odd);
-        if (len2 & 1)
-            crc1 = gf2_matrix_times(even, crc1);
-        len2 >>= 1;
-
-        /* if no more bits set, then done */
-        if (len2 == 0)
-            break;
-
-        /* another iteration of the loop with odd and even swapped */
-        gf2_matrix_square(odd, even);
-        if (len2 & 1)
-            crc1 = gf2_matrix_times(odd, crc1);
-        len2 >>= 1;
-
-        /* if no more bits set, then done */
-    } while (len2 != 0);
-
-    /* return combined crc */
-    crc1 ^= crc2;
-    return crc1;
+    if (len2 > 0)
+        /* operator for 2^n zeros repeats every GF2_DIM n values */
+        for (n = 0; len2; n = (n + 1) % GF2_DIM, len2 >>= 1)
+            if (len2 & 1)
+                crc1 = gf2_matrix_times(crc_comb[n], crc1);
+    return crc1 ^ crc2;
 }
 
 /* ========================================================================= */
@@ -497,7 +627,7 @@ uLong ZEXPORT crc32_combine64(crc1, crc2, len2)
 
 ZLIB_INTERNAL void crc_reset(deflate_state *const s)
 {
-#ifdef ADLER32_SIMD_SSSE3
+#ifdef CRC32_SIMD_SSE42_PCLMUL
     if (x86_cpu_enable_simd) {
         crc_fold_init(s);
         return;
@@ -508,7 +638,7 @@ ZLIB_INTERNAL void crc_reset(deflate_state *const s)
 
 ZLIB_INTERNAL void crc_finalize(deflate_state *const s)
 {
-#ifdef ADLER32_SIMD_SSSE3
+#ifdef CRC32_SIMD_SSE42_PCLMUL
     if (x86_cpu_enable_simd)
         s->strm->adler = crc_fold_512to32(s);
 #endif
@@ -516,7 +646,7 @@ ZLIB_INTERNAL void crc_finalize(deflate_state *const s)
 
 ZLIB_INTERNAL void copy_with_crc(z_streamp strm, Bytef *dst, long size)
 {
-#ifdef ADLER32_SIMD_SSSE3
+#ifdef CRC32_SIMD_SSE42_PCLMUL
     if (x86_cpu_enable_simd) {
         crc_fold_copy(strm->state, dst, strm->next_in, size);
         return;
